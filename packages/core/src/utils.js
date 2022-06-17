@@ -3,7 +3,10 @@ import * as ReactIs from "react-is";
 import mergeAllOf from "json-schema-merge-allof";
 import fill from "core-js-pure/features/array/fill";
 import union from "lodash/union";
+import isEmpty from "lodash/isEmpty";
 import jsonpointer from "jsonpointer";
+import fields from "./components/fields";
+import widgets from "./components/widgets";
 import validateFormData, { isValid } from "./validate";
 
 export const ADDITIONAL_PROPERTY_FLAG = "__additional_property";
@@ -74,6 +77,16 @@ export function canExpand(schema, uiSchema, formData) {
     return Object.keys(formData).length < schema.maxProperties;
   }
   return true;
+}
+
+export function getDefaultRegistry() {
+  return {
+    fields,
+    widgets,
+    definitions: {},
+    rootSchema: {},
+    formContext: {},
+  };
 }
 
 /* Gets the type of a given schema. */
@@ -208,10 +221,22 @@ function computeDefaults(
     );
   } else if ("oneOf" in schema) {
     schema =
-      schema.oneOf[getMatchingOption(undefined, schema.oneOf, rootSchema)];
+      schema.oneOf[
+        getMatchingOption(
+          isEmpty(formData) ? undefined : formData,
+          schema.oneOf,
+          rootSchema
+        )
+      ];
   } else if ("anyOf" in schema) {
     schema =
-      schema.anyOf[getMatchingOption(undefined, schema.anyOf, rootSchema)];
+      schema.anyOf[
+        getMatchingOption(
+          isEmpty(formData) ? undefined : formData,
+          schema.anyOf,
+          rootSchema
+        )
+      ];
   }
 
   // Not defaults defined for this node, fallback to generic typed ones.
@@ -356,6 +381,7 @@ export function getUiOptions(uiSchema) {
     .filter(key => key.indexOf("ui:") === 0)
     .reduce((options, key) => {
       const value = uiSchema[key];
+
       if (key === "ui:widget" && isObject(value)) {
         console.warn(
           "Setting options via ui:widget object is deprecated, use ui:options instead"
@@ -373,38 +399,18 @@ export function getUiOptions(uiSchema) {
     }, {});
 }
 
-export function getSubmitButtonOptions(uiSchema) {
-  const uiOptions = getUiOptions(uiSchema);
-  const defaultOptions = {
-    props: {
-      disabled: false,
-    },
-    submitText: "Submit",
-    norender: false,
-  };
-  if (uiOptions && uiOptions["submitButtonOptions"]) {
-    return Object.assign({}, defaultOptions, uiOptions["submitButtonOptions"]);
-  }
-
-  return defaultOptions;
-}
-
 export function getDisplayLabel(schema, uiSchema, rootSchema) {
   const uiOptions = getUiOptions(uiSchema);
   let { label: displayLabel = true } = uiOptions;
-  const schemaType = getSchemaType(schema);
-
-  if (schemaType === "array") {
+  if (schema.type === "array") {
     displayLabel =
       isMultiSelect(schema, rootSchema) ||
-      isFilesArray(schema, uiSchema, rootSchema) ||
-      isCustomWidget(uiSchema);
+      isFilesArray(schema, uiSchema, rootSchema);
   }
-
-  if (schemaType === "object") {
+  if (schema.type === "object") {
     displayLabel = false;
   }
-  if (schemaType === "boolean" && !uiSchema["ui:widget"]) {
+  if (schema.type === "boolean" && !uiSchema["ui:widget"]) {
     displayLabel = false;
   }
   if (uiSchema["ui:field"]) {
@@ -562,15 +568,6 @@ export function isFixedItems(schema) {
   );
 }
 
-export function isCustomWidget(uiSchema) {
-  return (
-    // TODO: Remove the `&& uiSchema["ui:widget"] !== "hidden"` once we support hidden widgets for arrays.
-    // https://react-jsonschema-form.readthedocs.io/en/latest/usage/widgets/#hidden-widgets
-    "widget" in getUiOptions(uiSchema) &&
-    getUiOptions(uiSchema)["widget"] !== "hidden"
-  );
-}
-
 export function allowAdditionalItems(schema) {
   if (schema.additionalItems === true) {
     console.warn("additionalItems=true is currently not supported");
@@ -586,7 +583,7 @@ export function optionsList(schema) {
     });
   } else {
     const altSchemas = schema.oneOf || schema.anyOf;
-    return altSchemas.map(schema => {
+    return altSchemas.map((schema, i) => {
       const value = toConstant(schema);
       const label = schema.title || String(value);
       return {
@@ -648,9 +645,6 @@ export function stubExistingAdditionalProperties(
     properties: { ...schema.properties },
   };
 
-  // make sure formData is an object
-  formData = isObject(formData) ? formData : {};
-
   Object.keys(formData).forEach(key => {
     if (schema.properties.hasOwnProperty(key)) {
       // No need to stub, our schema already has the property
@@ -679,40 +673,6 @@ export function stubExistingAdditionalProperties(
   return schema;
 }
 
-/**
- * Resolves a conditional block (if/else/then) by removing the condition and merging the appropriate conditional branch with the rest of the schema
- */
-const resolveCondition = (schema, rootSchema, formData) => {
-  let {
-    if: expression,
-    then,
-    else: otherwise,
-    ...resolvedSchemaLessConditional
-  } = schema;
-
-  const conditionalSchema = isValid(expression, formData, rootSchema)
-    ? then
-    : otherwise;
-
-  if (conditionalSchema) {
-    return retrieveSchema(
-      mergeSchemas(
-        resolvedSchemaLessConditional,
-        retrieveSchema(conditionalSchema, rootSchema, formData)
-      ),
-      rootSchema,
-      formData
-    );
-  } else {
-    return retrieveSchema(resolvedSchemaLessConditional, rootSchema, formData);
-  }
-};
-
-/**
- * Resolves references and dependencies within a schema and its 'allOf' children.
- *
- * Called internally by retrieveSchema.
- */
 export function resolveSchema(schema, rootSchema = {}, formData = {}) {
   if (schema.hasOwnProperty("$ref")) {
     return resolveReference(schema, rootSchema, formData);
@@ -750,38 +710,6 @@ export function retrieveSchema(schema, rootSchema = {}, formData = {}) {
     return {};
   }
   let resolvedSchema = resolveSchema(schema, rootSchema, formData);
-
-  if (schema.hasOwnProperty("if")) {
-    return resolveCondition(schema, rootSchema, formData);
-  }
-
-  // For each level of the dependency, we need to recursively determine the appropriate resolved schema given the current state of formData.
-  // Otherwise, nested allOf subschemas will not be correctly displayed.
-  if (resolvedSchema.properties) {
-    const properties = {};
-
-    Object.entries(resolvedSchema.properties).forEach(entries => {
-      const propName = entries[0];
-      const propSchema = entries[1];
-      const rawPropData = formData && formData[propName];
-      const propData = isObject(rawPropData) ? rawPropData : {};
-      const resolvedPropSchema = retrieveSchema(
-        propSchema,
-        rootSchema,
-        propData
-      );
-
-      properties[propName] = resolvedPropSchema;
-
-      if (
-        propSchema !== resolvedPropSchema &&
-        resolvedSchema.properties !== properties
-      ) {
-        resolvedSchema = { ...resolvedSchema, properties };
-      }
-    });
-  }
-
   if ("allOf" in schema) {
     try {
       resolvedSchema = mergeAllOf({
@@ -1078,32 +1006,24 @@ export function toIdSchema(
   id,
   rootSchema,
   formData = {},
-  idPrefix = "root",
-  idSeparator = "_"
+  idPrefix = "root"
 ) {
   const idSchema = {
     $id: id || idPrefix,
   };
   if ("$ref" in schema || "dependencies" in schema || "allOf" in schema) {
     const _schema = retrieveSchema(schema, rootSchema, formData);
-    return toIdSchema(_schema, id, rootSchema, formData, idPrefix, idSeparator);
+    return toIdSchema(_schema, id, rootSchema, formData, idPrefix);
   }
   if ("items" in schema && !schema.items.$ref) {
-    return toIdSchema(
-      schema.items,
-      id,
-      rootSchema,
-      formData,
-      idPrefix,
-      idSeparator
-    );
+    return toIdSchema(schema.items, id, rootSchema, formData, idPrefix);
   }
   if (schema.type !== "object") {
     return idSchema;
   }
   for (const name in schema.properties || {}) {
     const field = schema.properties[name];
-    const fieldId = idSchema.$id + idSeparator + name;
+    const fieldId = idSchema.$id + "_" + name;
     idSchema[name] = toIdSchema(
       isObject(field) ? field : {},
       fieldId,
@@ -1111,8 +1031,7 @@ export function toIdSchema(
       // It's possible that formData is not an object -- this can happen if an
       // array item has just been added, but not populated with data yet
       (formData || {})[name],
-      idPrefix,
-      idSeparator
+      idPrefix
     );
   }
   return idSchema;
@@ -1275,11 +1194,6 @@ export function rangeSpec(schema) {
 }
 
 export function getMatchingOption(formData, options, rootSchema) {
-  // For performance, skip validating subschemas if formData is undefined. We just
-  // want to get the first option in that case.
-  if (formData === undefined) {
-    return 0;
-  }
   for (let i = 0; i < options.length; i++) {
     const option = options[i];
 
